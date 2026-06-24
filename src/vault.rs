@@ -55,6 +55,10 @@ impl VaultContract {
         balance::set_total_shares(&env, total_shares + shares);
         balance::set_total_deposited(&env, total_deposited + amount);
 
+        // Update staked_at_ledger to current ledger sequence
+        let current_ledger = env.ledger().sequence();
+        env.storage().persistent().set(&DataKey::StakedAtLedger(depositor.clone()), &current_ledger);
+
         events::deposit(&env, &depositor, amount, shares);
 
         Ok(shares)
@@ -92,18 +96,48 @@ impl VaultContract {
             .get(&DataKey::Token)
             .ok_or(VaultError::NotInitialized)?;
 
+        // Check lockup & calculate penalty
+        let lock_period = env.storage().instance().get(&DataKey::LockPeriod).unwrap_or(0);
+        let penalty_bps = env.storage().instance().get(&DataKey::EarlyExitPenaltyBps).unwrap_or(0);
+
+        let current_ledger = env.ledger().sequence();
+        let is_locked = if lock_period == 0 {
+            false
+        } else {
+            match env.storage().persistent().get::<_, u32>(&DataKey::StakedAtLedger(withdrawer.clone())) {
+                Some(staked_at) => current_ledger < staked_at.saturating_add(lock_period),
+                None => false,
+            }
+        };
+
+        let amount_returned = if is_locked && penalty_bps > 0 {
+            let penalty = amount
+                .checked_mul(penalty_bps as i128)
+                .ok_or(VaultError::ArithmeticError)?
+                .checked_div(10000)
+                .ok_or(VaultError::ArithmeticError)?;
+            amount - penalty
+        } else {
+            amount
+        };
+
         // Burn shares
         balance::set_shares(&env, &withdrawer, user_shares - shares);
         balance::set_total_shares(&env, total_shares - shares);
-        balance::set_total_deposited(&env, total_deposited - amount);
+        balance::set_total_deposited(&env, total_deposited - amount_returned);
+
+        // Clean up staked_at_ledger if user has no shares left
+        if user_shares == shares {
+            env.storage().persistent().remove(&DataKey::StakedAtLedger(withdrawer.clone()));
+        }
 
         // Return tokens
         let token_client = token::Client::new(&env, &token_addr);
-        token_client.transfer(&env.current_contract_address(), &withdrawer, &amount);
+        token_client.transfer(&env.current_contract_address(), &withdrawer, &amount_returned);
 
-        events::withdraw(&env, &withdrawer, shares, amount);
+        events::withdraw(&env, &withdrawer, shares, amount_returned);
 
-        Ok(amount)
+        Ok(amount_returned)
     }
 
     /// Query share balance of a user.
@@ -251,6 +285,31 @@ impl VaultContract {
     pub fn get_withdrawal_limit(env: Env) -> Result<i128, VaultError> {
         let _ = admin::get_admin(&env)?; // ensures initialized
         Ok(balance::get_withdrawal_limit(&env).unwrap_or(0))
+    }
+
+    /// Admin: set the lock-up period in ledgers.
+    pub fn set_lock_period(env: Env, ledgers: u32) -> Result<(), VaultError> {
+        admin::require_admin(&env)?;
+        env.storage().instance().set(&DataKey::LockPeriod, &ledgers);
+        Ok(())
+    }
+
+    /// Admin: set the early exit penalty in basis points (max 2000 bps).
+    pub fn set_early_exit_penalty_bps(env: Env, bps: u32) -> Result<(), VaultError> {
+        admin::require_admin(&env)?;
+        if bps > 2000 {
+            return Err(VaultError::InvalidPenaltyBps);
+        }
+        env.storage().instance().set(&DataKey::EarlyExitPenaltyBps, &bps);
+        Ok(())
+    }
+
+    /// Query the current lock-up configuration: (lock_period, early_exit_penalty_bps).
+    pub fn get_lock_config(env: Env) -> Result<(u32, u32), VaultError> {
+        let _ = admin::get_admin(&env)?; // ensures initialized
+        let lock_period = env.storage().instance().get(&DataKey::LockPeriod).unwrap_or(0);
+        let penalty_bps = env.storage().instance().get(&DataKey::EarlyExitPenaltyBps).unwrap_or(0);
+        Ok((lock_period, penalty_bps))
     }
 
     // --- Internal helpers ---

@@ -10,6 +10,9 @@ pub enum DataKey {
     ShareBalance(Address),
     Paused,
     WithdrawalLimit,
+    LockPeriod,
+    EarlyExitPenaltyBps,
+    StakedAtLedger(Address),
 }
 
 #[contracttype]

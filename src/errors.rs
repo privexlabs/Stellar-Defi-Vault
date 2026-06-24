@@ -13,4 +13,5 @@ pub enum VaultError {
     InvalidToken = 7,
     ArithmeticError = 8,
     WithdrawalLimitExceeded = 9,
+    InvalidPenaltyBps = 10,
 }

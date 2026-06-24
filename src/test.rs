@@ -556,3 +556,117 @@ fn test_get_withdrawal_limit_before_init_fails() {
     let result = vault.try_get_withdrawal_limit();
     assert_eq!(result, Err(Ok(VaultError::NotInitialized)));
 }
+
+// ── lock-up period and early-unstake penalty tests ───────────────────────────
+
+#[test]
+fn test_set_lock_period_unauthorized_fails() {
+    let f = VaultFixture::new();
+    let result = f.vault.try_set_lock_period_as(&f.alice, &100);
+    assert_eq!(result, Err(Ok(VaultError::Unauthorized)));
+}
+
+#[test]
+fn test_set_early_exit_penalty_bps_unauthorized_fails() {
+    let f = VaultFixture::new();
+    let result = f.vault.try_set_early_exit_penalty_bps_as(&f.alice, &500);
+    assert_eq!(result, Err(Ok(VaultError::Unauthorized)));
+}
+
+#[test]
+fn test_set_early_exit_penalty_bps_exceeds_max_fails() {
+    let f = VaultFixture::new();
+    // 2001 BPS should fail
+    let result = f.vault.try_set_early_exit_penalty_bps(&2001);
+    assert_eq!(result, Err(Ok(VaultError::InvalidPenaltyBps)));
+}
+
+#[test]
+fn test_lock_config_query() {
+    let f = VaultFixture::new();
+    // Default config
+    let (lock_period, penalty_bps) = f.vault.get_lock_config();
+    assert_eq!(lock_period, 0);
+    assert_eq!(penalty_bps, 0);
+
+    // Set new config
+    f.vault.set_lock_period(&100);
+    f.vault.set_early_exit_penalty_bps(&1500);
+
+    let (lock_period, penalty_bps) = f.vault.get_lock_config();
+    assert_eq!(lock_period, 100);
+    assert_eq!(penalty_bps, 1500);
+}
+
+#[test]
+fn test_unstake_before_lock_expires_penalty_applied() {
+    let f = VaultFixture::new();
+    // Lock period: 10 ledgers, Penalty: 1000 bps (10%)
+    f.vault.set_lock_period(&10);
+    f.vault.set_early_exit_penalty_bps(&1000);
+
+    // Alice deposits 500k -> 500k shares
+    f.vault.deposit(&f.alice, &500_000);
+
+    // Mock ledger sequence number. Let's advance sequence to 5.
+    f.env.ledger().with_mut(|li| {
+        li.sequence_number = 5;
+    });
+
+    // Alice withdraws 100k shares before lock expires (5 < 10)
+    // 10% penalty should be applied: 10k penalty, 90k returned.
+    let amount_returned = f.vault.withdraw(&f.alice, &100_000);
+    assert_eq!(amount_returned, 90_000);
+
+    // Verify vault state.
+    // Alice burned 100k shares. Total shares = 400k.
+    // Total deposited is reduced by 90k (so 10k penalty stays in vault).
+    // Initial total deposited = 500k. New total deposited = 500k - 90k = 410k.
+    let (total_shares, total_deposited) = f.vault.vault_state();
+    assert_eq!(total_shares, 400_000);
+    assert_eq!(total_deposited, 410_000);
+}
+
+#[test]
+fn test_unstake_after_lock_expires_no_penalty() {
+    let f = VaultFixture::new();
+    // Lock period: 10 ledgers, Penalty: 1000 bps (10%)
+    f.vault.set_lock_period(&10);
+    f.vault.set_early_exit_penalty_bps(&1000);
+
+    // Alice deposits 500k -> 500k shares
+    f.vault.deposit(&f.alice, &500_000);
+
+    // Advance sequence to 11 (lock expired since 11 >= 0 + 10)
+    f.env.ledger().with_mut(|li| {
+        li.sequence_number = 11;
+    });
+
+    // Alice withdraws 100k shares. Full amount should be returned.
+    let amount_returned = f.vault.withdraw(&f.alice, &100_000);
+    assert_eq!(amount_returned, 100_000);
+
+    let (total_shares, total_deposited) = f.vault.vault_state();
+    assert_eq!(total_shares, 400_000);
+    assert_eq!(total_deposited, 400_000);
+}
+
+#[test]
+fn test_unstake_lock_zero_never_penalized() {
+    let f = VaultFixture::new();
+    // Lock period: 0, Penalty: 1000 bps (10%)
+    f.vault.set_lock_period(&0);
+    f.vault.set_early_exit_penalty_bps(&1000);
+
+    // Alice deposits 500k -> 500k shares
+    f.vault.deposit(&f.alice, &500_000);
+
+    // Alice withdraws immediately.
+    let amount_returned = f.vault.withdraw(&f.alice, &100_000);
+    assert_eq!(amount_returned, 100_000);
+
+    let (total_shares, total_deposited) = f.vault.vault_state();
+    assert_eq!(total_shares, 400_000);
+    assert_eq!(total_deposited, 400_000);
+}
+

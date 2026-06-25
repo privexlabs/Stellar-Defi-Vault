@@ -9,6 +9,7 @@ use soroban_sdk::{
 
 use crate::{
     errors::VaultError,
+    storage::LeaderboardEntry,
     vault::{
         VaultContract, VaultContractClient, BOOST_BPS_BASE, CONTRACT_VERSION,
         STELLAR_LEDGERS_PER_YEAR,
@@ -66,6 +67,19 @@ impl<'a> VaultFixture<'a> {
     }
 
     fn with_mock_auths(mock_auths: bool) -> Self {
+        Self::build(mock_auths, None, None)
+    }
+
+    /// Build a fixture with explicit stake/reward token decimals.
+    fn with_decimals(stake_decimals: u32, reward_decimals: u32) -> Self {
+        Self::build(true, Some(stake_decimals), Some(reward_decimals))
+    }
+
+    fn build(
+        mock_auths: bool,
+        stake_decimals: Option<u32>,
+        reward_decimals: Option<u32>,
+    ) -> Self {
         let env = Env::default();
         env.mock_all_auths();
         env.ledger().with_mut(|li| {
@@ -83,7 +97,7 @@ impl<'a> VaultFixture<'a> {
         let vault_id = env.register_contract(None, VaultContract);
         let vault = VaultContractClient::new(&env, &vault_id);
 
-        vault.initialize(&admin, &token_addr);
+        vault.initialize(&admin, &token_addr, &stake_decimals, &reward_decimals);
 
         // Mint starting balances
         token_admin.mint(&alice, &20_000_000);
@@ -121,7 +135,7 @@ fn test_double_initialize_fails() {
     let token_addr: soroban_sdk::Address = f
         .env
         .register_stellar_asset_contract(Address::generate(&f.env));
-    let result = f.vault.try_initialize(&f.admin, &token_addr);
+    let result = f.vault.try_initialize(&f.admin, &token_addr, &None, &None);
     assert_eq!(result, Err(Ok(VaultError::AlreadyInitialized)));
 }
 
@@ -669,6 +683,89 @@ fn test_lock_config_query() {
     assert_eq!(penalty_bps, 1500);
 }
 
+// ── unstake fee (separate from withdrawal fee) ────────────────────────────────
+
+#[test]
+fn test_set_and_get_unstake_fee_bps() {
+    let f = VaultFixture::new();
+    assert_eq!(f.vault.get_unstake_fee_bps(), 0);
+
+    f.vault.set_unstake_fee_bps(&f.admin, &250);
+    assert_eq!(f.vault.get_unstake_fee_bps(), 250);
+}
+
+#[test]
+fn test_set_unstake_fee_bps_requires_admin_auth() {
+    let f = VaultFixture::new();
+    f.vault.set_unstake_fee_bps(&f.admin, &100);
+    assert_eq!(f.env.auths()[0].0, f.admin);
+}
+
+#[test]
+fn test_set_unstake_fee_bps_allows_max() {
+    let f = VaultFixture::new();
+    f.vault.set_unstake_fee_bps(&f.admin, &500);
+    assert_eq!(f.vault.get_unstake_fee_bps(), 500);
+}
+
+#[test]
+fn test_set_unstake_fee_bps_too_high_rejected() {
+    let f = VaultFixture::new();
+    let result = f.vault.try_set_unstake_fee_bps(&f.admin, &501);
+    assert_eq!(result, Err(Ok(VaultError::UnstakeFeeTooHigh)));
+}
+
+#[test]
+fn test_unstake_with_zero_fee_returns_full_principal() {
+    let f = VaultFixture::new();
+    f.vault.deposit(&f.alice, &600_000);
+
+    let token_before = f.token.balance(&f.alice);
+    let amount_back = f.vault.withdraw(&f.alice, &300_000);
+
+    assert_eq!(amount_back, 300_000);
+    assert_eq!(f.token.balance(&f.alice), token_before + 300_000);
+    // No fee configured, so nothing is routed to the treasury.
+    assert_eq!(f.vault.get_reward_pool_balance(), 0);
+}
+
+#[test]
+fn test_unstake_deducts_fee_and_credits_treasury() {
+    let f = VaultFixture::new();
+    f.vault.set_unstake_fee_bps(&f.admin, &500); // 5%
+    f.vault.deposit(&f.alice, &600_000);
+
+    let token_before = f.token.balance(&f.alice);
+    let amount_back = f.vault.withdraw(&f.alice, &300_000);
+
+    // 5% of 300_000 = 15_000 fee; 285_000 returned to the user.
+    assert_eq!(amount_back, 285_000);
+    assert_eq!(f.token.balance(&f.alice), token_before + 285_000);
+    // Fee is routed to the reward pool treasury, not burned.
+    assert_eq!(f.vault.get_reward_pool_balance(), 15_000);
+}
+
+#[test]
+fn test_unstake_fee_applies_after_lock_penalty() {
+    let f = VaultFixture::new();
+    f.vault.set_lock_period(&100);
+    f.vault.set_early_exit_penalty_bps(&1000); // 10%
+    f.vault.set_unstake_fee_bps(&f.admin, &500); // 5%
+
+    set_ledger(&f.env, 1);
+    f.vault.deposit(&f.alice, &1_000_000);
+
+    let token_before = f.token.balance(&f.alice);
+    set_ledger(&f.env, 50); // still within the lock-up window
+    let amount_back = f.vault.withdraw(&f.alice, &1_000_000);
+
+    // Penalty first: 10% of 1_000_000 = 100_000 -> 900_000 after penalty.
+    // Fee on the remainder: 5% of 900_000 = 45_000 -> 855_000 returned.
+    assert_eq!(amount_back, 855_000);
+    assert_eq!(f.token.balance(&f.alice), token_before + 855_000);
+    assert_eq!(f.vault.get_reward_pool_balance(), 45_000);
+}
+
 // ── governance vote weight snapshots (Issue #31) ─────────────────────────────
 
 #[test]
@@ -842,6 +939,66 @@ fn test_reward_checkpoint_on_top_up_avoids_overpaying() {
     assert_eq!(f.vault.calc_pending_reward(&f.alice), 300);
 }
 
+// ── reward token decimal normalization ────────────────────────────────────────
+
+#[test]
+fn test_initialize_defaults_decimals_to_seven() {
+    // Pools initialized without explicit decimals fall back to 7/7.
+    let f = VaultFixture::new();
+    assert_eq!(f.vault.stake_decimals(), 7);
+    assert_eq!(f.vault.reward_decimals(), 7);
+}
+
+#[test]
+fn test_initialize_stores_custom_decimals() {
+    let f = VaultFixture::with_decimals(7, 6);
+    assert_eq!(f.vault.stake_decimals(), 7);
+    assert_eq!(f.vault.reward_decimals(), 6);
+}
+
+#[test]
+fn test_pending_reward_same_decimals_unchanged() {
+    // With matching decimals the normalized reward equals the raw reward,
+    // preserving the existing behaviour. Raw reward over `n` ledgers at a
+    // 100% APR on a one-year stake is exactly `n`.
+    let f = VaultFixture::with_decimals(7, 7);
+    let annual_stake = STELLAR_LEDGERS_PER_YEAR as i128;
+
+    f.vault.set_reward_rate_bps(&BOOST_BPS_BASE);
+    f.vault.stake(&f.alice, &annual_stake);
+
+    set_ledger(&f.env, 100);
+    assert_eq!(f.vault.calc_pending_reward(&f.alice), 100);
+}
+
+#[test]
+fn test_pending_reward_scaled_down_when_reward_decimals_smaller() {
+    // Reward token has fewer decimals than the stake token (6 vs 7), so the
+    // raw reward of 100 is divided by 10^(7-6) = 10.
+    let f = VaultFixture::with_decimals(7, 6);
+    let annual_stake = STELLAR_LEDGERS_PER_YEAR as i128;
+
+    f.vault.set_reward_rate_bps(&BOOST_BPS_BASE);
+    f.vault.stake(&f.alice, &annual_stake);
+
+    set_ledger(&f.env, 100);
+    assert_eq!(f.vault.calc_pending_reward(&f.alice), 10);
+}
+
+#[test]
+fn test_pending_reward_scaled_up_when_reward_decimals_larger() {
+    // Reward token has more decimals than the stake token (9 vs 7), so the
+    // raw reward of 100 is multiplied by 10^(9-7) = 100.
+    let f = VaultFixture::with_decimals(7, 9);
+    let annual_stake = STELLAR_LEDGERS_PER_YEAR as i128;
+
+    f.vault.set_reward_rate_bps(&BOOST_BPS_BASE);
+    f.vault.stake(&f.alice, &annual_stake);
+
+    set_ledger(&f.env, 100);
+    assert_eq!(f.vault.calc_pending_reward(&f.alice), 10_000);
+}
+
 // ── pool cap (TVL limit) ──────────────────────────────────────────────────────
 
 #[test]
@@ -919,11 +1076,14 @@ fn test_admin_can_raise_and_lower_cap() {
 }
 
 #[test]
-fn test_non_admin_cannot_set_pool_cap() {
+fn test_set_pool_cap_requires_admin_auth() {
+    // With mock_all_auths, env.auths() records every require_auth() call.
+    // Verify that set_pool_cap requires the stored admin to authorise the call.
     let f = VaultFixture::new();
-
-    let result = f.vault.try_set_pool_cap(&1_000_000);
-    assert_eq!(result, Err(Ok(VaultError::Unauthorized)));
+    f.vault.set_pool_cap(&1_000_000);
+    let auths = f.env.auths();
+    let admin_auth_required = auths.iter().any(|(addr, _)| *addr == f.admin);
+    assert!(admin_auth_required, "set_pool_cap must require admin auth");
 }
 
 #[test]
@@ -985,6 +1145,7 @@ fn test_pool_cap_updated_emits_event() {
     );
     let data = soroban_sdk::Vec::<soroban_sdk::Val>::try_from_val(&f.env, &event.2).unwrap();
     assert_eq!(i128::try_from_val(&f.env, &data.get(0).unwrap()).unwrap(), 1_000_000);
+    assert_eq!(f.vault.get_pool_cap(), 1_000_000);
 }
 
 #[test]
@@ -1084,13 +1245,11 @@ fn test_total_rewards_paid_increments_after_unstake_then_claim() {
 #[test]
 fn test_get_stake_token_returns_initialized_token() {
     let f = VaultFixture::new();
-    let token_addr: soroban_sdk::Address = f
-        .env
-        .storage()
-        .instance()
-        .get(&crate::storage::DataKey::Token)
-        .unwrap();
-    assert_eq!(f.vault.get_stake_token(), token_addr);
+    // get_stake_token() and get_pool_config().stake_token must agree since both
+    // read the same underlying value set during initialize.
+    let stake_token = f.vault.get_stake_token();
+    let config = f.vault.get_pool_config();
+    assert_eq!(stake_token, config.stake_token);
 }
 
 #[test]
@@ -1150,8 +1309,10 @@ fn test_simulate_compound_yields_more_than_simple() {
     let f = VaultFixture::new();
     f.vault.set_reward_rate_bps(&BOOST_BPS_BASE);
 
-    let compound = f.vault.simulate_compound(&1_000_000, &10_000, &1_000);
-    let simple = f.vault.simulate_stake(&1_000_000, &10_000);
+    // 1_000_000_000 principal ensures each compounding interval produces enough
+    // reward that the cumulative boost is visible above integer-division truncation.
+    let compound = f.vault.simulate_compound(&1_000_000_000, &10_000, &1_000);
+    let simple = f.vault.simulate_stake(&1_000_000_000, &10_000);
     assert!(compound > simple);
 }
 
@@ -1171,7 +1332,9 @@ fn test_simulate_boost_impact_with_schedule() {
     f.vault.set_reward_rate_bps(&BOOST_BPS_BASE);
     f.vault.set_boost_schedule(&schedule);
 
-    let (base, boosted) = f.vault.simulate_boost_impact(&1_000_000, &1000);
+    // 6_308 ledgers at 100% APR on 1M principal produces exactly 1_000 base reward
+    // (1_000_000 * 10_000 * 6_308 / 10_000 / 6_307_200 = 1_000).
+    let (base, boosted) = f.vault.simulate_boost_impact(&1_000_000, &6_308);
     assert_eq!(base, 1_000);
     assert!(boosted > base);
 }

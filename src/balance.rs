@@ -224,6 +224,70 @@ pub fn remove_delegate(env: &Env, user: &Address) {
         .remove(&DataKey::Delegate(user.clone()));
 }
 
+// ── Issue #39: reward token ───────────────────────────────────────────────────
+
+pub fn get_reward_token(env: &Env) -> Option<Address> {
+    env.storage().instance().get(&DataKey::RewardToken)
+}
+
+pub fn set_reward_token(env: &Env, token: &Address) {
+    env.storage().instance().set(&DataKey::RewardToken, token);
+}
+
+// ── Issue #40: NFT contract ───────────────────────────────────────────────────
+
+pub fn get_nft_contract(env: &Env) -> Option<Address> {
+    env.storage().instance().get(&DataKey::NftContract)
+}
+
+pub fn set_nft_contract(env: &Env, nft: &Address) {
+    env.storage().instance().set(&DataKey::NftContract, nft);
+}
+
+// ── Issue #41: restake grace window ──────────────────────────────────────────
+
+pub fn get_restake_window(env: &Env) -> u32 {
+    env.storage().instance().get(&DataKey::RestakeWindow).unwrap_or(0)
+}
+
+pub fn set_restake_window(env: &Env, ledgers: u32) {
+    env.storage().instance().set(&DataKey::RestakeWindow, &ledgers);
+}
+
+pub fn get_last_unstake_ledger(env: &Env, user: &Address) -> Option<u32> {
+    env.storage().persistent().get(&DataKey::LastUnstakeLedger(user.clone()))
+}
+
+pub fn set_last_unstake_ledger(env: &Env, user: &Address, ledger: u32) {
+    env.storage().persistent().set(&DataKey::LastUnstakeLedger(user.clone()), &ledger);
+}
+
+pub fn is_restaked(env: &Env, user: &Address) -> bool {
+    env.storage().persistent().get(&DataKey::Restaked(user.clone())).unwrap_or(false)
+}
+
+pub fn set_restaked(env: &Env, user: &Address, value: bool) {
+    env.storage().persistent().set(&DataKey::Restaked(user.clone()), &value);
+}
+
+pub fn remove_restaked(env: &Env, user: &Address) {
+    let key = DataKey::Restaked(user.clone());
+    if env.storage().persistent().has(&key) {
+        env.storage().persistent().remove(&key);
+    }
+}
+
+// ── Issue #42: admin action count ────────────────────────────────────────────
+
+pub fn get_admin_action_count(env: &Env) -> u32 {
+    env.storage().instance().get(&DataKey::AdminActionCount).unwrap_or(0)
+}
+
+pub fn increment_admin_action_count(env: &Env) {
+    let count = get_admin_action_count(env);
+    env.storage().instance().set(&DataKey::AdminActionCount, &(count + 1));
+}
+
 // ── Claim cap (issue #78) ─────────────────────────────────────────────────────
 
 pub fn get_claim_cap(env: &Env) -> i128 {

@@ -19,6 +19,8 @@ pub enum VaultError {
     InvalidBoostSchedule = 13,
     InsufficientRewardPool = 14,
     NotADelegate = 15,
+    CannotRescueStakeToken = 16,
+    CannotRescueRewardToken = 17,
     PoolCapReached = 16,
     /// No active position found for a given user when expected.
     PositionNotFound = 17,

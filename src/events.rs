@@ -219,3 +219,12 @@ pub fn pool_initialized(
         (admin.clone(), stake_token.clone(), reward_token.clone(), reward_rate_bps),
     );
 }
+
+// ── Issue #101: frozen position event ─────────────────────────────────────────
+
+/// Emitted when an admin flags a user's position as frozen via `flag_frozen`.
+pub fn frozen_position(env: &Env, admin: &Address, user: &Address, frozen_at: u32) {
+    let topics = (symbol_short!("frz_pos"), admin);
+    env.events()
+        .publish(topics, (user.clone(), frozen_at, env.ledger().sequence()));
+}

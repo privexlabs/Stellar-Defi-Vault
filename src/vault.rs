@@ -1662,6 +1662,79 @@ impl VaultContract {
             .unwrap_or(Vec::new(&env)))
     }
 
+    // --- Staker rank (issue #<branch-number>) ---
+
+    /// Read-only: returns the rank of `user` among all active stakers.
+    ///
+    /// Rank 1 is the largest staker. Rank is computed dynamically from the
+    /// staker registry — it does **not** depend on the optional leaderboard
+    /// storage (issue #32).
+    ///
+    /// Returns `Some(rank)` where `rank` equals 1 + the number of stakers
+    /// whose position is strictly larger than the queried user's position.
+    /// Returns `None` when the user has no active staking position
+    /// (i.e. their share balance is zero).
+    ///
+    /// **Tie-breaking**: when two stakers hold equal token amounts, the one
+    /// whose `Address` bytes compare as *less-than* is considered higher-ranked
+    /// (lower rank number). This makes the result fully deterministic across
+    /// nodes without requiring any additional on-chain state.
+    ///
+    /// No authentication required.
+    pub fn get_staker_rank(env: Env, user: Address) -> Option<u32> {
+        // No position → return None.
+        let user_shares = balance::get_shares(&env, &user);
+        if user_shares == 0 {
+            return None;
+        }
+
+        let total_shares = balance::get_total_shares(&env);
+        let total_deposited = balance::get_total_deposited(&env);
+
+        // Convert the queried user's shares to token units.
+        let user_amount =
+            balance::shares_to_amount(total_shares, total_deposited, user_shares).unwrap_or(0);
+
+        // Walk every registered staker and count how many rank above this user.
+        // A staker ranks above when:
+        //   - their amount is strictly greater, OR
+        //   - their amount is equal AND their address bytes are less-than user's bytes
+        //     (lower bytes → better rank for tie-breaking determinism).
+        let all_stakers = balance::get_all_stakers(&env);
+        let mut rank: u32 = 1;
+        let mut i = 0u32;
+        while i < all_stakers.len() {
+            let other = all_stakers.get(i).unwrap();
+            // Skip the user themselves.
+            if other == user {
+                i += 1;
+                continue;
+            }
+            let other_shares = balance::get_shares(&env, &other);
+            if other_shares == 0 {
+                i += 1;
+                continue;
+            }
+            let other_amount =
+                balance::shares_to_amount(total_shares, total_deposited, other_shares)
+                    .unwrap_or(0);
+
+            let other_ranks_higher = if other_amount != user_amount {
+                other_amount > user_amount
+            } else {
+                // Equal amounts: compare address bytes — smaller bytes → higher rank.
+                other.to_string() < user.to_string()
+            };
+
+            if other_ranks_higher {
+                rank += 1;
+            }
+            i += 1;
+        }
+
+        Some(rank)
+    }
+
     // --- Simulation functions (Issue #54) ---
 
     /// Simulate the reward for staking `amount` tokens for `ledgers` ledger sequences

@@ -2588,3 +2588,99 @@ fn test_initialize_stores_reward_rate() {
     vault.initialize(&admin, &token_addr, &1_000_u32, &None, &None);
     assert_eq!(vault.get_reward_rate_bps(), 1_000);
 }
+
+// ── get_staker_rank (Add-get_staker_rank) ─────────────────────────────────────
+
+/// Sole staker is rank 1.
+///
+/// When only one address has an active position, that address is the largest
+/// staker by definition and should be returned as rank 1.
+#[test]
+fn test_get_staker_rank_sole_staker_is_rank_1() {
+    let f = VaultFixture::new();
+    f.vault.stake(&f.alice, &500_000);
+
+    let rank = f.vault.get_staker_rank(&f.alice);
+    assert_eq!(rank, Some(1), "sole staker should be rank 1");
+}
+
+/// Largest of three stakers is rank 1.
+///
+/// With three stakers at different amounts, the one with the largest deposit
+/// must receive rank 1 and the others must rank lower accordingly.
+#[test]
+fn test_get_staker_rank_largest_of_three_is_rank_1() {
+    let f = VaultFixture::new();
+    let charlie = Address::generate(&f.env);
+    f.token_admin.mint(&charlie, &20_000_000);
+
+    // alice: 300_000, bob: 100_000, charlie: 500_000
+    f.vault.stake(&f.alice, &300_000);
+    f.vault.stake(&f.bob, &100_000);
+    f.vault.stake(&charlie, &500_000);
+
+    // Charlie deposited the most — rank 1.
+    assert_eq!(f.vault.get_staker_rank(&charlie), Some(1), "charlie (largest) should be rank 1");
+    // Alice is second.
+    assert_eq!(f.vault.get_staker_rank(&f.alice), Some(2), "alice should be rank 2");
+    // Bob is third.
+    assert_eq!(f.vault.get_staker_rank(&f.bob), Some(3), "bob should be rank 3");
+}
+
+/// User with no active position returns None.
+///
+/// An address that has never staked (or has fully unstaked) must return None
+/// so callers can distinguish "not a staker" from "ranked last".
+#[test]
+fn test_get_staker_rank_no_position_returns_none() {
+    let f = VaultFixture::new();
+    // alice has never staked — should return None.
+    let rank = f.vault.get_staker_rank(&f.alice);
+    assert_eq!(rank, None, "address with no position should return None");
+
+    // Stake and then fully unstake — should also return None afterwards.
+    f.vault.stake(&f.alice, &200_000);
+    assert_eq!(f.vault.get_staker_rank(&f.alice), Some(1));
+    let alice_shares = f.vault.shares_of(&f.alice);
+    f.vault.unstake(&f.alice, &alice_shares);
+    assert_eq!(
+        f.vault.get_staker_rank(&f.alice),
+        None,
+        "after full unstake position should be None"
+    );
+}
+
+/// Tied amounts are handled deterministically by address order.
+///
+/// When two stakers hold exactly the same token amount, the one whose
+/// address string compares as less-than (lower bytes) gets the better rank.
+/// The order must be stable and reproducible regardless of insertion order.
+#[test]
+fn test_get_staker_rank_ties_broken_deterministically() {
+    let f = VaultFixture::new();
+
+    // Stake equal amounts for alice and bob.
+    f.vault.stake(&f.alice, &500_000);
+    f.vault.stake(&f.bob, &500_000);
+
+    let alice_rank = f.vault.get_staker_rank(&f.alice).expect("alice has a position");
+    let bob_rank = f.vault.get_staker_rank(&f.bob).expect("bob has a position");
+
+    // Ranks must be distinct (1 and 2) and stable.
+    assert_ne!(alice_rank, bob_rank, "tied stakers must have different ranks");
+    assert!(
+        (alice_rank == 1 && bob_rank == 2) || (alice_rank == 2 && bob_rank == 1),
+        "tied stakers must occupy ranks 1 and 2"
+    );
+
+    // The deterministic rule: smaller address string → better rank.
+    let alice_str = f.alice.to_string();
+    let bob_str = f.bob.to_string();
+    if alice_str < bob_str {
+        assert_eq!(alice_rank, 1, "alice (lower address) should rank above bob when tied");
+        assert_eq!(bob_rank, 2);
+    } else {
+        assert_eq!(bob_rank, 1, "bob (lower address) should rank above alice when tied");
+        assert_eq!(alice_rank, 2);
+    }
+}
